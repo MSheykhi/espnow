@@ -1,22 +1,32 @@
 #include <stdio.h>
-#include "string.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/Task.h"
+#include "freertos/task.h"
+#include "driver/adc.h"
+#include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_log.h"
+#include "string.h"
 #include "esp_now.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
-#include "esp_log.h"
-#include "driver/gpio.h"
+
+static const char *TAG = "Main";
+
+#define LED_GPIO 18               // Change this to your specific GPIO pin used for power control
+#define GPIO_POWER_PIN GPIO_NUM_1 // Change this to your specific GPIO pin used for power control
+// Assuming ADC channels can be mapped directly to GPIO numbers
+int gpio_pins_for_adc_channels[] = {GPIO_NUM_0, GPIO_NUM_1, GPIO_NUM_2, GPIO_NUM_3}; // Example GPIO numbers, replace with actual mappings
+
+#define GPIO_POWER_PIN_SEL ((1ULL << GPIO_NUM_1))
+// #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_NUM_0) | (1ULL<<GPIO_NUM_1) | (1ULL<<GPIO_NUM_2) | (1ULL<<GPIO_NUM_3))
 
 #define ESP_CHANNEL 1
 #define Unlock_io 14
 
 static uint8_t peer_mac[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-
-static const char *TAG = "esp_now_init";
 
 static esp_err_t init_wifi()
 {
@@ -37,15 +47,15 @@ static esp_err_t init_wifi()
 void recv_cb(const esp_now_recv_info_t *esp_now_info, const uint8_t *data, int data_len)
 {
     ESP_LOGI(TAG, "Data recived: " MACSTR " %s ", MAC2STR(esp_now_info->src_addr), data);
-    if (strcmp((char*)data, "Open") == 0)
+    if (strcmp((char *)data, "Open") == 0)
     {
         ESP_LOGI(TAG, "Open");
     }
-    else if (strcmp((char*)data, "Close") == 0)
+    else if (strcmp((char *)data, "Close") == 0)
     {
         ESP_LOGI(TAG, "Close");
     }
-    else if (strcmp((char*)data, "Alarm") == 0)
+    else if (strcmp((char *)data, "Alarm") == 0)
     {
         ESP_LOGI(TAG, "Alarm");
     }
@@ -70,7 +80,6 @@ void sent_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
 static esp_err_t init_esp_now()
 {
     esp_now_init();
-    esp_now_register_recv_cb(recv_cb);
     esp_now_register_send_cb(sent_cb);
 
     ESP_LOGI(TAG, "esp now init completed");
@@ -88,31 +97,72 @@ static esp_err_t register_peer(uint8_t *peer_addr)
     return ESP_OK;
 }
 
+void set_power(bool power)
+{
+    if (power)
+    {
+        gpio_reset_pin(GPIO_POWER_PIN);
+        gpio_set_direction(GPIO_POWER_PIN, GPIO_MODE_OUTPUT);
+        gpio_set_level(GPIO_POWER_PIN, 0);
+    }
+    else
+    {
+        gpio_reset_pin(GPIO_POWER_PIN);
+        gpio_set_direction(GPIO_POWER_PIN, GPIO_MODE_OUTPUT);
+        gpio_set_level(GPIO_POWER_PIN, 1);
+    }
+}
 
 void app_main(void)
 {
 
-    gpio_config_t io_conf;
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pin_bit_mask = 1ULL<<Unlock_io;
-    io_conf.pull_down_en = 0;
-    io_conf.pull_up_en = 1;
-    gpio_config(&io_conf);
+    // Set GPIO for LED control
+
+    // Initialize ADC for channel 0, 1, 2, 3 (Assuming ADC1)
+    adc_oneshot_unit_handle_t adc1_handle;
+    adc_oneshot_unit_init_cfg_t adc1_init_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    adc_oneshot_new_unit(&adc1_init_cfg, &adc1_handle);
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = ADC_ATTEN_DB_11,
+        .bitwidth = ADC_WIDTH_BIT_12,
+    };
+
+    adc_channel_t channel[] = {ADC_CHANNEL_0, ADC_CHANNEL_1, ADC_CHANNEL_2, ADC_CHANNEL_3};
+    for (int i = 0; i < 4; i++)
+    {
+        adc_oneshot_config_channel(adc1_handle, channel[i], &chan_cfg);
+    }
+
+    // Read ADC values and calculate voltages
+    int adc_values[4];
+    float adc_voltages[4];
+    float reference_voltage = 3.9; // Reference voltage for ADC_ATTEN_DB_11
+    int resolution = 4096;         // Resolution for ADC_WIDTH_BIT_12
+    for (int i = 0; i < 4; i++)
+    {
+        adc_oneshot_read(adc1_handle, channel[i], &adc_values[i]);
+        adc_voltages[i] = (adc_values[i] * reference_voltage) / resolution;
+        ESP_LOGI(TAG, "ADC Channel %d: %d, Voltage: %.2fV", i, adc_values[i], adc_voltages[i]);
+    }
+    // printf("adc Done, ShutDown!");
+    // vTaskDelay(pdMS_TO_TICKS(100));
+    set_power(true);
+
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO, 0); // Set GPIO high to shut down
 
     ESP_ERROR_CHECK(init_wifi());
     ESP_ERROR_CHECK(init_esp_now());
     ESP_ERROR_CHECK(register_peer(peer_mac));
 
-    uint8_t data [] = "Open";
+    uint8_t data[] = "Open";
 
-    while (true)
-    {
-        if (!gpio_get_level(Unlock_io)){
-            ESP_ERROR_CHECK(esp_now_send(peer_mac, data, sizeof(data)));
-            vTaskDelay(200/portTICK_PERIOD_MS);
-        }
-    }
+    ESP_ERROR_CHECK(esp_now_send(peer_mac, data, sizeof(data)));
     
-    
+    ESP_LOGI(TAG, "Power Off.");
+    set_power(false);
 }
